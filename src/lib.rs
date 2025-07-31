@@ -9,6 +9,7 @@ pub mod file_watcher;
 pub mod gui;
 pub mod kanata;
 pub mod oskbd;
+pub mod proof_of_concept;
 pub mod tcp_server;
 #[cfg(test)]
 pub mod tests;

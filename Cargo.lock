@@ -774,6 +774,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "clap",
+ "core-foundation 0.9.4",
  "core-graphics 0.24.0",
  "dirs",
  "embed-resource",

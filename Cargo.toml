@@ -38,6 +38,10 @@ path = "src/lib.rs"
 name = "kanata"
 path = "src/main.rs"
 
+[[bin]]
+name = "mouse_proof_of_concept"
+path = "src/bin/mouse_proof_of_concept.rs"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = [ "std", "derive", "help", "suggestions" ], default-features = false }
@@ -66,6 +70,7 @@ arboard = "3.4"
 karabiner-driverkit = "0.1.5"
 objc = "0.2.7"
 core-graphics = "0.24.0"
+core-foundation = "0.9.4"
 open = { version = "5", optional = true }
 libc = "0.2"
 os_pipe = "1.2.1"
