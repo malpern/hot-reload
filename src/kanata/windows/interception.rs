@@ -183,7 +183,7 @@ fn is_device_interceptable(
     // Get hardware ID for filtering
     let mut hwid = [0u8; HWID_ARR_SZ];
     log::trace!("getting hardware id for input dev: {input_dev}");
-    let res = intrcptn.get_hardware_id(input_dev, &mut hwid);
+    let _res = intrcptn.get_hardware_id(input_dev, &mut hwid);
 
     // Extract VID/PID from hardware ID for VID/PID filtering
     let vid_pid = if allowed_vid_pids.is_some() || excluded_vid_pids.is_some() {
@@ -198,7 +198,9 @@ fn is_device_interceptable(
             .take_while(|&c| c != 0) // Stop at null terminator
             .collect();
 
-        let hardware_id_string = OsString::from_wide(&wide_chars).to_string_lossy();
+        let hardware_id_string = OsString::from_wide(&wide_chars)
+            .to_string_lossy()
+            .to_string();
 
         // Extract VID/PID from hardware ID string
         crate::main_lib::parse_vid_pid_from_hardware_id(&hardware_id_string).and_then(

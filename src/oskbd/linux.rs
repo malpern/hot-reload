@@ -737,12 +737,11 @@ pub fn discover_devices(
                 };
                 let device_name = pd.0.name().unwrap_or("");
 
-                let should_include =
-                    kanata_parser::cfg::should_include_device_by_vid_pid(
-                        device_vid_pid,
-                        include_vid_pids,
-                        exclude_vid_pids,
-                    );
+                let should_include = kanata_parser::cfg::should_include_device_by_vid_pid(
+                    device_vid_pid,
+                    include_vid_pids,
+                    exclude_vid_pids,
+                );
 
                 if let Some((v, p)) = device_vid_pid {
                     if should_include {
