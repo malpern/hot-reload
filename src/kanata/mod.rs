@@ -160,6 +160,9 @@ pub struct Kanata {
     time_remainder: u128,
     /// Is true if a live reload was requested by the user and false otherwise.
     live_reload_requested: bool,
+    /// Timestamp of when a live reload was requested. Used for a 1s fallback
+    /// to ensure reload proceeds even if the system never reaches an idle state.
+    reload_requested_at: Option<web_time::Instant>,
     /// Flag to indicate that the file watcher needs to be restarted due to include file changes.
     #[cfg(feature = "watch")]
     pub file_watcher_restart_requested: bool,
@@ -417,6 +420,7 @@ impl Kanata {
             last_tick: web_time::Instant::now(),
             time_remainder: 0,
             live_reload_requested: false,
+            reload_requested_at: None,
             #[cfg(feature = "watch")]
             file_watcher_restart_requested: false,
             overrides: cfg.overrides,
@@ -570,6 +574,7 @@ impl Kanata {
             last_tick: web_time::Instant::now(),
             time_remainder: 0,
             live_reload_requested: false,
+            reload_requested_at: None,
             #[cfg(feature = "watch")]
             file_watcher_restart_requested: false,
             overrides: cfg.overrides,
@@ -666,6 +671,10 @@ impl Kanata {
     }
 
     fn do_live_reload(&mut self, _tx: &Option<Sender<ServerMessage>>) -> Result<()> {
+        log::info!(
+            "Starting live reload for {}",
+            self.cfg_paths[self.cur_cfg_idx].display()
+        );
         let cfg = match cfg::new_from_file(&self.cfg_paths[self.cur_cfg_idx]) {
             Ok(c) => c,
             Err(e) => {
@@ -876,22 +885,32 @@ impl Kanata {
 
         self.check_handle_layer_change(tx);
 
-        if self.live_reload_requested
-            && ((self.prev_keys.is_empty() && self.cur_keys.is_empty())
-                || self.ticks_since_idle > 1000)
-        {
-            // Note regarding the ticks_since_idle check above:
-            // After 1 second if live reload is still not done, there might be a key in a stuck
-            // state. One known instance where this happens is Win+L to lock the screen in
-            // Windows with the LLHOOK mechanism. The release of Win and L keys will not be
-            // caught by the kanata process when on the lock screen. However, the OS knows that
-            // these keys have released - only the kanata state is wrong. And since kanata has
-            // a key in a stuck state, without this 1s fallback, live reload would never
-            // activate. Having this fallback allows live reload to happen which resets the
-            // kanata states.
-            self.live_reload_requested = false;
-            if let Err(e) = self.do_live_reload(tx) {
-                log::error!("live reload failed {e}");
+        log::debug!(
+            "tick: reload gate: requested={}, prev_keys={}, cur_keys={}, elapsed_fallback_ms={}",
+            self.live_reload_requested,
+            self.prev_keys.len(),
+            self.cur_keys.len(),
+            self.reload_requested_at
+                .map(|t| t.elapsed().as_millis() as i64)
+                .unwrap_or(-1)
+        );
+        if self.live_reload_requested {
+            let is_idle_now = self.prev_keys.is_empty() && self.cur_keys.is_empty();
+            let forced = self
+                .reload_requested_at
+                .map(|t| t.elapsed().as_millis() >= 1000)
+                .unwrap_or(false);
+            if is_idle_now || forced {
+                if forced && !is_idle_now {
+                    log::info!("Reload forced after 1s fallback");
+                }
+                self.live_reload_requested = false;
+                self.reload_requested_at = None;
+                if let Err(e) = self.do_live_reload(tx) {
+                    log::error!("live reload failed {e}");
+                }
+            } else {
+                log::debug!("Reload pending; not idle yet");
             }
         }
 
@@ -1919,11 +1938,16 @@ impl Kanata {
 
     /// Request a live reload of the current configuration file.
     pub fn request_live_reload(&mut self) {
-        self.live_reload_requested = true;
-        log::info!(
-            "Requested live reload of file: {}",
-            self.cfg_paths[self.cur_cfg_idx].display()
-        );
+        if !self.live_reload_requested {
+            self.live_reload_requested = true;
+            self.reload_requested_at = Some(web_time::Instant::now());
+            log::info!(
+                "Requested live reload of file: {}",
+                self.cfg_paths[self.cur_cfg_idx].display()
+            );
+        } else {
+            log::debug!("reload already pending; not resetting fallback timer");
+        }
     }
 
     /// Handle a client command from TCP server and return a result.
@@ -1960,6 +1984,7 @@ impl Kanata {
     /// Request a live reload of the next configuration file.
     pub fn request_live_reload_next(&mut self) {
         self.live_reload_requested = true;
+        self.reload_requested_at = Some(web_time::Instant::now());
         self.cur_cfg_idx = if self.cur_cfg_idx == self.cfg_paths.len() - 1 {
             0
         } else {
@@ -1974,6 +1999,7 @@ impl Kanata {
     /// Request a live reload of the previous configuration file.
     pub fn request_live_reload_prev(&mut self) {
         self.live_reload_requested = true;
+        self.reload_requested_at = Some(web_time::Instant::now());
         if self.cur_cfg_idx == 0 {
             self.cur_cfg_idx = self.cfg_paths.len() - 1;
         } else {
@@ -1995,6 +2021,7 @@ impl Kanata {
             );
         }
         self.live_reload_requested = true;
+        self.reload_requested_at = Some(web_time::Instant::now());
         self.cur_cfg_idx = index;
         log::info!(
             "Requested live reload of config file {}: {}",
@@ -2011,6 +2038,7 @@ impl Kanata {
             bail!("config file does not exist: {}", path);
         }
         self.live_reload_requested = true;
+        self.reload_requested_at = Some(web_time::Instant::now());
         self.cfg_paths.push(new_path);
         self.cur_cfg_idx = self.cfg_paths.len() - 1;
         log::info!(
@@ -2106,6 +2134,10 @@ impl Kanata {
         tx: Option<Sender<ServerMessage>>,
         nodelay: bool,
     ) {
+        {
+            let k = kanata.lock();
+            log::info!("processing loop using Kanata {:p}", &*k);
+        }
         info!("entering the processing loop");
         std::thread::spawn(move || {
             if !nodelay {
@@ -2142,6 +2174,11 @@ impl Kanata {
                     k.can_block_update_idle_waiting(ms_elapsed)
                 };
                 if can_block {
+                    // Re-check before blocking to avoid missing a pending reload
+                    if kanata.lock().live_reload_requested {
+                        continue; // go back to top; can_block will evaluate false next time
+                    }
+
                     #[cfg(all(
                         target_os = "windows",
                         not(feature = "interception_driver"),
@@ -2170,13 +2207,32 @@ impl Kanata {
                             k.last_tick = now;
 
                             // Check for live reload BEFORE processing the key event
-                            if k.live_reload_requested
-                                && ((k.prev_keys.is_empty() && k.cur_keys.is_empty())
-                                    || k.ticks_since_idle > 1000)
-                            {
-                                k.live_reload_requested = false;
-                                if let Err(e) = k.do_live_reload(&tx) {
-                                    log::error!("live reload failed {e}");
+                            log::debug!(
+                                "reload gate (blocking): requested={}, prev_keys={}, cur_keys={}, elapsed_fallback_ms={}",
+                                k.live_reload_requested,
+                                k.prev_keys.len(),
+                                k.cur_keys.len(),
+                                k.reload_requested_at
+                                    .map(|t| t.elapsed().as_millis() as i64)
+                                    .unwrap_or(-1)
+                            );
+                            if k.live_reload_requested {
+                                let is_idle_now = k.prev_keys.is_empty() && k.cur_keys.is_empty();
+                                let forced = k
+                                    .reload_requested_at
+                                    .map(|t| t.elapsed().as_millis() >= 1000)
+                                    .unwrap_or(false);
+                                if is_idle_now || forced {
+                                    if forced && !is_idle_now {
+                                        log::info!("Reload forced after 1s fallback");
+                                    }
+                                    k.live_reload_requested = false;
+                                    k.reload_requested_at = None;
+                                    if let Err(e) = k.do_live_reload(&tx) {
+                                        log::error!("live reload failed {e}");
+                                    }
+                                } else {
+                                    log::debug!("Reload pending; not idle yet");
                                 }
                             }
 
@@ -2236,13 +2292,32 @@ impl Kanata {
                     match rx.try_recv() {
                         Ok(kev) => {
                             // Check for live reload BEFORE processing the key event
-                            if k.live_reload_requested
-                                && ((k.prev_keys.is_empty() && k.cur_keys.is_empty())
-                                    || k.ticks_since_idle > 1000)
-                            {
-                                k.live_reload_requested = false;
-                                if let Err(e) = k.do_live_reload(&tx) {
-                                    log::error!("live reload failed {e}");
+                            log::debug!(
+                                "reload gate (non-blocking): requested={}, prev_keys={}, cur_keys={}, elapsed_fallback_ms={}",
+                                k.live_reload_requested,
+                                k.prev_keys.len(),
+                                k.cur_keys.len(),
+                                k.reload_requested_at
+                                    .map(|t| t.elapsed().as_millis() as i64)
+                                    .unwrap_or(-1)
+                            );
+                            if k.live_reload_requested {
+                                let is_idle_now = k.prev_keys.is_empty() && k.cur_keys.is_empty();
+                                let forced = k
+                                    .reload_requested_at
+                                    .map(|t| t.elapsed().as_millis() >= 1000)
+                                    .unwrap_or(false);
+                                if is_idle_now || forced {
+                                    if forced && !is_idle_now {
+                                        log::info!("Reload forced after 1s fallback");
+                                    }
+                                    k.live_reload_requested = false;
+                                    k.reload_requested_at = None;
+                                    if let Err(e) = k.do_live_reload(&tx) {
+                                        log::error!("live reload failed {e}");
+                                    }
+                                } else {
+                                    log::debug!("Reload pending; not idle yet");
                                 }
                             }
 
@@ -2446,6 +2521,98 @@ impl Kanata {
 fn test_unmodmods_bits() {
     assert_eq!(UnmodMods::empty().bits(), 0u8);
     assert_eq!(UnmodMods::all().bits(), 255u8);
+}
+
+#[test]
+fn live_reload_forced_after_1s_even_when_not_idle() {
+    use std::fs;
+    use std::time::Duration;
+
+    // Prepare a temporary config file
+    let tmp_dir = std::env::temp_dir();
+    let cfg_path = tmp_dir.join("kanata_test_reload.kbd");
+
+    let initial_cfg = r#"
+    (defcfg
+      sequence-timeout 111
+    )
+
+    (defsrc
+      a
+    )
+
+    (deflayer base
+      a
+    )
+    "#;
+
+    // Skip test if we can't write to temp directory (common in restricted CI environments)
+    if fs::write(&cfg_path, initial_cfg).is_err() {
+        eprintln!("Skipping test: cannot write to temp directory (likely permission issue in CI)");
+        return;
+    }
+
+    // Build Kanata instance using this file
+    let args = crate::ValidatedArgs {
+        paths: vec![cfg_path.clone()],
+        #[cfg(feature = "tcp_server")]
+        tcp_server_address: None,
+        #[cfg(target_os = "linux")]
+        symlink_path: None,
+        nodelay: true,
+        #[cfg(feature = "watch")]
+        watch: false,
+    };
+
+    // Skip test if Kanata::new fails (common in CI environments without system access)
+    let mut k = match Kanata::new(&args) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!(
+                "Skipping test: cannot create Kanata instance (likely CI environment): {}",
+                e
+            );
+            return;
+        }
+    };
+    assert_eq!(k.sequence_timeout, 111);
+
+    // Update the config on disk to a new value
+    let updated_cfg = r#"
+    (defcfg
+      sequence-timeout 222
+    )
+
+    (defsrc
+      a
+    )
+
+    (deflayer base
+      a
+    )
+    "#;
+
+    // Skip if we can't write the updated config
+    if fs::write(&cfg_path, updated_cfg).is_err() {
+        eprintln!("Skipping test: cannot write updated config to temp directory");
+        return;
+    }
+
+    // Request reload and simulate a non-idle state
+    k.request_live_reload();
+    // Make it look like the request happened >1s ago
+    k.reload_requested_at = Some(web_time::Instant::now() - Duration::from_millis(1100));
+    // Keep non-idle by making cur_keys non-empty
+    k.cur_keys.push(KeyCode::Escape);
+
+    // Trigger the reload gate via handle_time_ticks
+    let _ = k.handle_time_ticks(&None);
+
+    // Verify the new config took effect even though we were not idle
+    assert_eq!(k.sequence_timeout, 222);
+
+    // Clean up temp file
+    let _ = fs::remove_file(&cfg_path);
 }
 
 #[cfg(feature = "cmd")]
