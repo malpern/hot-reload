@@ -77,6 +77,7 @@ pub fn start_file_watcher(kanata_arc: Arc<Mutex<Kanata>>) -> Result<()> {
     // Store the debouncer in the Kanata struct
     {
         let mut k = kanata_arc.lock();
+        log::info!("file watcher started for Kanata {:p}", &*k);
         k.file_watcher = Some(debouncer);
     }
 
@@ -119,10 +120,14 @@ pub fn create_debouncer(
 
                                     // Set the live_reload_requested flag
                                     if let Some(mut kanata) = kanata_arc_clone.try_lock() {
+                                        log::debug!(
+                                            "watcher: setting live_reload_requested on Kanata {:p}",
+                                            &*kanata
+                                        );
                                         kanata.request_live_reload();
                                     } else {
                                         log::warn!(
-                                            "Could not acquire lock to set live_reload_requested"
+                                            "watcher: Could not acquire lock to set live_reload_requested"
                                         );
                                     }
                                 }
