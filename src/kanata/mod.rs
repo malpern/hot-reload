@@ -671,6 +671,10 @@ impl Kanata {
     }
 
     fn do_live_reload(&mut self, _tx: &Option<Sender<ServerMessage>>) -> Result<()> {
+        log::info!(
+            "Starting live reload for {}",
+            self.cfg_paths[self.cur_cfg_idx].display()
+        );
         let cfg = match cfg::new_from_file(&self.cfg_paths[self.cur_cfg_idx]) {
             Ok(c) => c,
             Err(e) => {
@@ -881,6 +885,15 @@ impl Kanata {
 
         self.check_handle_layer_change(tx);
 
+        log::debug!(
+            "tick: reload gate: requested={}, prev_keys={}, cur_keys={}, elapsed_fallback_ms={}",
+            self.live_reload_requested,
+            self.prev_keys.len(),
+            self.cur_keys.len(),
+            self.reload_requested_at
+                .map(|t| t.elapsed().as_millis() as i64)
+                .unwrap_or(-1)
+        );
         if self.live_reload_requested {
             let is_idle_now = self.prev_keys.is_empty() && self.cur_keys.is_empty();
             let forced = self
@@ -1925,12 +1938,16 @@ impl Kanata {
 
     /// Request a live reload of the current configuration file.
     pub fn request_live_reload(&mut self) {
-        self.live_reload_requested = true;
-        self.reload_requested_at = Some(web_time::Instant::now());
-        log::info!(
-            "Requested live reload of file: {}",
-            self.cfg_paths[self.cur_cfg_idx].display()
-        );
+        if !self.live_reload_requested {
+            self.live_reload_requested = true;
+            self.reload_requested_at = Some(web_time::Instant::now());
+            log::info!(
+                "Requested live reload of file: {}",
+                self.cfg_paths[self.cur_cfg_idx].display()
+            );
+        } else {
+            log::debug!("reload already pending; not resetting fallback timer");
+        }
     }
 
     /// Handle a client command from TCP server and return a result.
@@ -2117,6 +2134,10 @@ impl Kanata {
         tx: Option<Sender<ServerMessage>>,
         nodelay: bool,
     ) {
+        {
+            let k = kanata.lock();
+            log::info!("processing loop using Kanata {:p}", &*k);
+        }
         info!("entering the processing loop");
         std::thread::spawn(move || {
             if !nodelay {
@@ -2153,6 +2174,11 @@ impl Kanata {
                     k.can_block_update_idle_waiting(ms_elapsed)
                 };
                 if can_block {
+                    // Re-check before blocking to avoid missing a pending reload
+                    if kanata.lock().live_reload_requested {
+                        continue; // go back to top; can_block will evaluate false next time
+                    }
+
                     #[cfg(all(
                         target_os = "windows",
                         not(feature = "interception_driver"),
@@ -2181,6 +2207,15 @@ impl Kanata {
                             k.last_tick = now;
 
                             // Check for live reload BEFORE processing the key event
+                            log::debug!(
+                                "reload gate (blocking): requested={}, prev_keys={}, cur_keys={}, elapsed_fallback_ms={}",
+                                k.live_reload_requested,
+                                k.prev_keys.len(),
+                                k.cur_keys.len(),
+                                k.reload_requested_at
+                                    .map(|t| t.elapsed().as_millis() as i64)
+                                    .unwrap_or(-1)
+                            );
                             if k.live_reload_requested {
                                 let is_idle_now = k.prev_keys.is_empty() && k.cur_keys.is_empty();
                                 let forced = k
@@ -2257,6 +2292,15 @@ impl Kanata {
                     match rx.try_recv() {
                         Ok(kev) => {
                             // Check for live reload BEFORE processing the key event
+                            log::debug!(
+                                "reload gate (non-blocking): requested={}, prev_keys={}, cur_keys={}, elapsed_fallback_ms={}",
+                                k.live_reload_requested,
+                                k.prev_keys.len(),
+                                k.cur_keys.len(),
+                                k.reload_requested_at
+                                    .map(|t| t.elapsed().as_millis() as i64)
+                                    .unwrap_or(-1)
+                            );
                             if k.live_reload_requested {
                                 let is_idle_now = k.prev_keys.is_empty() && k.cur_keys.is_empty();
                                 let forced = k

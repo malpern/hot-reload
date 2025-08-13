@@ -278,7 +278,118 @@ pub struct Cfg {
     pub zippy: Option<(ZchPossibleChords, ZchConfig)>,
 }
 
-/// Parse a new configuration from a file.
+/// Diagnostic severity levels for configuration validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticSeverity {
+    Error,
+    Warning,
+}
+
+/// A diagnostic message from configuration validation.
+#[derive(Debug, Clone)]
+pub struct Diagnostic {
+    pub file: Option<String>,
+    pub line: usize,
+    pub column: Option<usize>,
+    pub message: String,
+    pub severity: DiagnosticSeverity,
+}
+
+/// Validate a configuration string and return structured diagnostics.
+pub fn validate_config_str(cfg_text: &str) -> (Vec<Diagnostic>, Vec<Diagnostic>) {
+    validate_config_with_files(cfg_text, &HashMap::default())
+}
+
+/// Validate a configuration string with file includes and return structured diagnostics.
+pub fn validate_config_with_files(
+    cfg_text: &str, 
+    file_content: &HashMap<String, String>
+) -> (Vec<Diagnostic>, Vec<Diagnostic>) {
+    let mut errors = Vec::new();
+    let warnings = Vec::new(); // TODO: Implement warnings collection in future
+    
+    // Try to parse the configuration using the existing parser
+    match new_from_str(cfg_text, file_content.clone()) {
+        Ok(_) => {
+            // Configuration is valid
+        }
+        Err(err) => {
+            let diagnostic = extract_diagnostic_from_miette_error(&err);
+            errors.push(diagnostic);
+        }
+    }
+    
+    (errors, warnings)
+}
+
+fn extract_diagnostic_from_miette_error(err: &miette::Error) -> Diagnostic {
+    // Convert the error to string and try to extract useful information
+    let error_str = format!("{}", err);
+    
+    // Try to extract line information from the error display
+    let line = extract_line_number_from_error_string(&error_str).unwrap_or(1);
+    
+    Diagnostic {
+        file: Some("configuration".to_string()),
+        line,
+        column: None,
+        message: extract_clean_message(&error_str),
+        severity: DiagnosticSeverity::Error,
+    }
+}
+
+fn extract_line_number_from_error_string(error_str: &str) -> Option<usize> {
+    // Look for patterns like "at line X" or "line X:"
+    for line in error_str.lines() {
+        if let Some(pos) = line.find("at line ") {
+            let start = pos + 8;
+            if let Some(end) = line[start..].find(char::is_whitespace) {
+                if let Ok(line_num) = line[start..start + end].parse::<usize>() {
+                    return Some(line_num);
+                }
+            }
+        }
+        if let Some(pos) = line.find("line ") {
+            let start = pos + 5;
+            if let Some(end) = line[start..].find(char::is_whitespace) {
+                if let Ok(line_num) = line[start..start + end].parse::<usize>() {
+                    return Some(line_num);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_clean_message(error_str: &str) -> String {
+    // Remove the help text and keep only the main error message
+    if let Some(help_start) = error_str.find("\n\nFor more info, see the configuration guide:") {
+        error_str[..help_start].trim().to_string()
+    } else {
+        error_str.trim().to_string()
+    }
+}
+
+fn extract_diagnostic_from_parse_error(parse_err: &ParseError) -> Diagnostic {
+    if let Some(span) = &parse_err.span {
+        Diagnostic {
+            file: Some(span.file_name().to_string()),
+            line: span.start.line + 1, // Convert to 1-based line numbering
+            column: Some(span.start.absolute - span.start.line_beginning + 1), // Convert to 1-based column
+            message: parse_err.msg.clone(),
+            severity: DiagnosticSeverity::Error,
+        }
+    } else {
+        Diagnostic {
+            file: None,
+            line: 1,
+            column: None,
+            message: parse_err.msg.clone(),
+            severity: DiagnosticSeverity::Error,
+        }
+    }
+}
+
 pub fn new_from_file(p: &Path) -> MResult<Cfg> {
     parse_cfg(p)
 }
