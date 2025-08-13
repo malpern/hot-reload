@@ -144,7 +144,7 @@ impl TcpServer {
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 match stream {
-                    Ok(mut stream) => {
+                    Ok(stream) => {
                         let addr = stream
                             .peer_addr()
                             .expect("incoming conn has known address")
@@ -168,6 +168,7 @@ impl TcpServer {
                         let kanata = kanata.clone();
                         let wakeup_channel = wakeup_channel.clone();
                         std::thread::spawn(move || {
+                            let mut stream = stream.try_clone().expect("stream is clonable");
                             let mut quiet = false;
                             let mut sent_initial_layer_change = false;
                             for v in reader {
@@ -320,6 +321,10 @@ impl TcpServer {
                                                         "Error writing response to RequestCurrentLayerName: {err}"
                                                     ),
                                                 }
+                                            }
+                                            ClientMessage::SetSessionMode { .. } => {
+                                                // SetSessionMode is handled at the top of the loop
+                                                // This arm is just to satisfy the exhaustive match
                                             }
                                             ClientMessage::ValidateConfig { config_content, request_id } => {
                                                 log::info!("tcp server ValidateConfig action");
@@ -554,7 +559,7 @@ mod tests {
     #[test]
     fn test_validate_config_content_size_limit() {
         // Test the size limit scenario
-        let large_config = "a".repeat(MAX_VALIDATION_CONFIG_BYTES + 1);
+        let _large_config = "a".repeat(MAX_VALIDATION_CONFIG_BYTES + 1);
         
         // This would normally be tested via the TCP handler, but we can test the validation logic
         // The size check happens in the TCP handler, not in validate_config_content itself
