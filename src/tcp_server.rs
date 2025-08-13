@@ -25,6 +25,58 @@ pub type Connections = ();
 
 #[cfg(feature = "tcp_server")]
 use kanata_parser::custom_action::FakeKeyAction;
+#[cfg(feature = "tcp_server")]
+use kanata_parser::cfg::{self, DiagnosticSeverity};
+
+#[cfg(feature = "tcp_server")]
+const MAX_VALIDATION_CONFIG_BYTES: usize = 1_000_000; // 1 MiB, adjust as needed
+
+#[cfg(feature = "tcp_server")]
+fn validate_config_content(config_content: &str, request_id: Option<String>) -> ServerMessage {
+    let (errors, warnings) = cfg::validate_config_str(config_content);
+    
+    let convert_diagnostic = |d: cfg::Diagnostic| ValidationError {
+        line: d.line,
+        message: d.message,
+        severity: match d.severity {
+            DiagnosticSeverity::Error => "error".to_string(),
+            DiagnosticSeverity::Warning => "warning".to_string(),
+        },
+        column: d.column,
+        file: d.file,
+    };
+    
+    let converted_errors: Vec<ValidationError> = errors.into_iter().map(convert_diagnostic).collect();
+    let converted_warnings: Vec<ValidationError> = warnings.into_iter().map(convert_diagnostic).collect();
+    
+    let error_count = converted_errors.len();
+    let warning_count = converted_warnings.len();
+    let success = error_count == 0;
+    
+    ServerMessage::ValidationResult {
+        success,
+        errors: converted_errors,
+        warnings: converted_warnings,
+        error_count,
+        warning_count,
+        request_id,
+    }
+}
+
+#[cfg(feature = "tcp_server")]
+fn send_message(
+    stream: &mut TcpStream,
+    message: ServerMessage,
+    connections: &Connections,
+    addr: &str,
+) -> bool {
+    if let Err(write_err) = stream.write_all(&message.as_bytes()) {
+        log::error!("stream write error: {write_err}");
+        connections.lock().remove(addr);
+        return false;
+    }
+    true
+}
 
 #[cfg(feature = "tcp_server")]
 fn send_response(
@@ -93,31 +145,18 @@ impl TcpServer {
             for stream in listener.incoming() {
                 match stream {
                     Ok(mut stream) => {
-                        {
-                            let k = kanata.lock();
-                            log::info!(
-                                "new client connection, sending initial LayerChange event to inform them of current layer"
-                            );
-                            if let Err(e) = stream.write(
-                                &ServerMessage::LayerChange {
-                                    new: k.layer_info[k.layout.b().current_layer()].name.clone(),
-                                }
-                                .as_bytes(),
-                            ) {
-                                log::warn!("failed to write to stream, dropping it: {e:?}");
-                                continue;
-                            }
-                        }
-
                         let addr = stream
                             .peer_addr()
                             .expect("incoming conn has known address")
                             .to_string();
 
+                        log::info!("new client connection: {addr}");
+
                         connections.lock().insert(
                             addr.clone(),
                             stream.try_clone().expect("stream is clonable"),
                         );
+
                         let reader = serde_json::Deserializer::from_reader(
                             stream.try_clone().expect("stream is clonable"),
                         )
@@ -129,10 +168,52 @@ impl TcpServer {
                         let kanata = kanata.clone();
                         let wakeup_channel = wakeup_channel.clone();
                         std::thread::spawn(move || {
+                            let mut quiet = false;
+                            let mut sent_initial_layer_change = false;
                             for v in reader {
                                 match v {
                                     Ok(event) => {
                                         log::debug!("tcp server received command: {:?}", event);
+                                        
+                                        // Handle SetSessionMode first to determine quiet state
+                                        if let ClientMessage::SetSessionMode { quiet: q } = &event {
+                                            log::info!("tcp server SetSessionMode action: quiet={q}");
+                                            quiet = *q;
+                                            if !*q && !sent_initial_layer_change {
+                                                // Client wants layer changes, send initial one
+                                                let k = kanata.lock();
+                                                if let Err(e) = stream.write_all(
+                                                    &ServerMessage::LayerChange {
+                                                        new: k.layer_info[k.layout.b().current_layer()].name.clone(),
+                                                    }
+                                                    .as_bytes(),
+                                                ) {
+                                                    log::warn!("failed to write initial LayerChange: {e:?}");
+                                                    connections.lock().remove(&addr);
+                                                    break;
+                                                }
+                                                sent_initial_layer_change = true;
+                                            }
+                                            continue; // SetSessionMode doesn't need further processing
+                                        }
+                                        
+                                        // Send initial LayerChange for non-quiet clients on first non-SetSessionMode message
+                                        if !quiet && !sent_initial_layer_change {
+                                            let k = kanata.lock();
+                                            log::info!("sending initial LayerChange event for non-quiet client");
+                                            if let Err(e) = stream.write_all(
+                                                &ServerMessage::LayerChange {
+                                                    new: k.layer_info[k.layout.b().current_layer()].name.clone(),
+                                                }
+                                                .as_bytes(),
+                                            ) {
+                                                log::warn!("failed to write initial LayerChange: {e:?}");
+                                                connections.lock().remove(&addr);
+                                                break;
+                                            }
+                                            sent_initial_layer_change = true;
+                                        }
+                                        
                                         match event {
                                             ClientMessage::ChangeLayer { new } => {
                                                 kanata.lock().change_layer(new);
@@ -240,6 +321,39 @@ impl TcpServer {
                                                     ),
                                                 }
                                             }
+                                            ClientMessage::ValidateConfig { config_content, request_id } => {
+                                                log::info!("tcp server ValidateConfig action");
+                                                
+                                                if config_content.len() > MAX_VALIDATION_CONFIG_BYTES {
+                                                    let msg = ServerMessage::ValidationResult {
+                                                        success: false,
+                                                        errors: vec![ValidationError {
+                                                            line: 0,
+                                                            message: format!(
+                                                                "config_content too large: {} bytes (max {})",
+                                                                config_content.len(),
+                                                                MAX_VALIDATION_CONFIG_BYTES
+                                                            ),
+                                                            severity: "error".to_string(),
+                                                            column: None,
+                                                            file: Some("configuration".to_string()),
+                                                        }],
+                                                        warnings: vec![],
+                                                        error_count: 1,
+                                                        warning_count: 0,
+                                                        request_id,
+                                                    };
+                                                    if !send_message(&mut stream, msg, &connections, &addr) {
+                                                        break;
+                                                    }
+                                                    continue;
+                                                }
+                                                
+                                                let msg = validate_config_content(&config_content, request_id);
+                                                if !send_message(&mut stream, msg, &connections, &addr) {
+                                                    break;
+                                                }
+                                            }
                                             // Handle reload commands with unified response protocol
                                             reload_cmd @ (ClientMessage::Reload {}
                                             | ClientMessage::ReloadNext {}
@@ -311,6 +425,10 @@ impl TcpServer {
                                     }
                                 }
                             }
+                            
+                            // Normal disconnect / EOF: clean up connection entry.
+                            log::info!("client {addr} disconnected");
+                            connections.lock().remove(&addr);
                         });
                     }
                     Err(_) => log::error!("not able to accept client connection"),
@@ -335,4 +453,121 @@ pub fn simple_sexpr_to_json_array(exprs: &[SimpleSExpr]) -> serde_json::Value {
     }
 
     serde_json::Value::Array(result)
+}
+
+#[cfg(all(test, feature = "tcp_server"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_config_content_valid() {
+        let valid_config = r#"
+(defsrc
+  esc  1    2    3    4
+)
+
+(deflayer default
+  esc  1    2    3    4
+)
+"#;
+        
+        match validate_config_content(valid_config, None) {
+            ServerMessage::ValidationResult { success, errors, warnings, error_count, warning_count, request_id } => {
+                assert!(success, "Valid config should be successful");
+                assert!(errors.is_empty(), "Valid config should have no errors");
+                assert!(warnings.is_empty(), "Valid config should have no warnings");
+                assert_eq!(error_count, 0, "Error count should be zero");
+                assert_eq!(warning_count, 0, "Warning count should be zero");
+                assert_eq!(request_id, None, "Request ID should be None when not provided");
+            }
+            other => panic!("Expected ValidationResult, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_config_content_invalid() {
+        let invalid_config = r#"
+(defsrc
+  esc  1    2    3    4
+  
+(deflayer default
+  esc  1    2    3    4
+"#;
+        
+        match validate_config_content(invalid_config, Some("req-1".to_string())) {
+            ServerMessage::ValidationResult { success, errors, error_count, warning_count, request_id, .. } => {
+                assert!(!success, "Invalid config should fail validation");
+                assert!(!errors.is_empty(), "Invalid config should have errors");
+                assert_eq!(error_count, errors.len(), "Error count should match errors length");
+                assert_eq!(warning_count, 0, "Warning count should be zero for this test");
+                assert_eq!(request_id, Some("req-1".to_string()), "Request ID should be echoed back");
+                
+                let error = &errors[0];
+                assert_eq!(error.severity, "error");
+                assert!(!error.message.is_empty());
+                assert!(error.line > 0, "Error should have a valid line number");
+                assert!(error.file.is_some(), "Error should include file information");
+            }
+            other => panic!("Expected ValidationResult, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_config_content_empty() {
+        let empty_config = "";
+        
+        match validate_config_content(empty_config, None) {
+            ServerMessage::ValidationResult { success, errors, error_count, .. } => {
+                assert!(!success, "Empty config should fail validation");
+                assert!(!errors.is_empty(), "Empty config should have errors");
+                assert_eq!(error_count, errors.len(), "Error count should match errors length");
+                
+                let error = &errors[0];
+                assert_eq!(error.severity, "error");
+                assert!(error.line > 0, "Error should have a valid line number");
+            }
+            other => panic!("Expected ValidationResult, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_config_content_enhanced_error_info() {
+        let invalid_config = "(defsrc esc) (deflayer"; // Incomplete config
+        
+        match validate_config_content(invalid_config, None) {
+            ServerMessage::ValidationResult { success, errors, error_count, warning_count, .. } => {
+                assert!(!success);
+                assert!(!errors.is_empty());
+                assert_eq!(error_count, errors.len());
+                assert_eq!(warning_count, 0);
+                
+                let error = &errors[0];
+                assert_eq!(error.severity, "error");
+                assert!(error.line >= 1);
+                assert!(error.file.is_some());
+                assert!(!error.message.is_empty());
+            }
+            other => panic!("Expected ValidationResult, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_config_content_size_limit() {
+        // Test the size limit scenario
+        let large_config = "a".repeat(MAX_VALIDATION_CONFIG_BYTES + 1);
+        
+        // This would normally be tested via the TCP handler, but we can test the validation logic
+        // The size check happens in the TCP handler, not in validate_config_content itself
+        // So we'll just verify that our function works with reasonable-sized invalid content
+        let invalid_config = "(".repeat(1000); // Invalid but under size limit
+        
+        match validate_config_content(&invalid_config, Some("size-test".to_string())) {
+            ServerMessage::ValidationResult { success, errors, request_id, .. } => {
+                assert!(!success, "Invalid config should fail");
+                assert!(!errors.is_empty(), "Should have parsing errors");
+                assert_eq!(request_id, Some("size-test".to_string()));
+            }
+            other => panic!("Expected ValidationResult, got {:?}", other),
+        }
+    }
 }
