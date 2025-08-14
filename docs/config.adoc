@@ -4584,8 +4584,34 @@ The server responds with a structured `ValidationResult`:
   "ValidationResult": {
     "success": true,
     "errors": [],
-    "warnings": [],
+    "warnings": [], 
     "error_count": 0,
+    "warning_count": 0,
+    "request_id": "optional-correlation-id"
+  }
+}
+----
+
+For invalid configurations, the response includes detailed error information:
+
+[source,json]
+----
+{
+  "ValidationResult": {
+    "success": false,
+    "errors": [
+      {
+        "line": 3,
+        "column": 15,
+        "message": "Unclosed opening parenthesis",
+        "severity": "error",
+        "category": "syntax",
+        "file": "configuration",
+        "help_text": "Check parentheses balance"
+      }
+    ],
+    "warnings": [],
+    "error_count": 1,
     "warning_count": 0,
     "request_id": "optional-correlation-id"
   }
