@@ -25,14 +25,10 @@ pub enum ServerMessage {
 pub struct ValidationError {
     pub line: usize,
     pub message: String,
-    pub severity: String,
-    #[serde(default)]
+    pub severity: String, // "error" or "warning"
     pub column: Option<usize>,
-    #[serde(default)]
     pub file: Option<String>,
-    #[serde(default)]
-    pub category: Option<String>, // "syntax", "semantic", "include", "platform"
-    #[serde(default)]
+    pub category: String, // "syntax", "semantic", "include", "platform"
     pub help_text: Option<String>,
 }
 
@@ -181,7 +177,7 @@ mod tests {
                 severity: "error".to_string(),
                 column: Some(15),
                 file: Some("config.kbd".to_string()),
-                category: Some("syntax".to_string()),
+                category: "syntax".to_string(),
                 help_text: Some("Check parentheses balance".to_string()),
             }],
             warnings: vec![ValidationError {
@@ -190,7 +186,7 @@ mod tests {
                 severity: "warning".to_string(),
                 column: None,
                 file: None,
-                category: Some("semantic".to_string()),
+                category: "semantic".to_string(),
                 help_text: None,
             }],
             error_count: 1,
@@ -251,19 +247,27 @@ mod tests {
     }
 
     #[test]
-    fn test_backward_compatibility_validation_error() {
-        // Test that old ValidationError format still deserializes correctly
-        let old_format_json = r#"{
-            "line": 5,
-            "message": "Syntax error",
-            "severity": "error"
-        }"#;
+    fn test_validation_error_serialization() {
+        // Test ValidationError serialization with all fields
+        let error = ValidationError {
+            line: 5,
+            message: "Syntax error".to_string(),
+            severity: "error".to_string(),
+            column: Some(12),
+            file: Some("config.kbd".to_string()),
+            category: "syntax".to_string(),
+            help_text: Some("Check your syntax".to_string()),
+        };
         
-        let validation_error: ValidationError = serde_json::from_str(old_format_json).unwrap();
-        assert_eq!(validation_error.line, 5);
-        assert_eq!(validation_error.message, "Syntax error");
-        assert_eq!(validation_error.severity, "error");
-        assert_eq!(validation_error.column, None);
-        assert_eq!(validation_error.file, None);
+        let json = serde_json::to_string(&error).unwrap();
+        let deserialized: ValidationError = serde_json::from_str(&json).unwrap();
+        
+        assert_eq!(deserialized.line, 5);
+        assert_eq!(deserialized.message, "Syntax error");
+        assert_eq!(deserialized.severity, "error");
+        assert_eq!(deserialized.column, Some(12));
+        assert_eq!(deserialized.file, Some("config.kbd".to_string()));
+        assert_eq!(deserialized.category, "syntax");
+        assert_eq!(deserialized.help_text, Some("Check your syntax".to_string()));
     }
 }

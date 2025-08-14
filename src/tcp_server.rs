@@ -44,12 +44,12 @@ fn validate_config_content(config_content: &str, request_id: Option<String>) -> 
         },
         column: d.column,
         file: d.file,
-        category: Some(match d.category {
+        category: match d.category {
             cfg::ErrorCategory::Syntax => "syntax".to_string(),
             cfg::ErrorCategory::Semantic => "semantic".to_string(),
             cfg::ErrorCategory::Include => "include".to_string(),
             cfg::ErrorCategory::Platform => "platform".to_string(),
-        }),
+        },
         help_text: d.help_text,
     };
     
@@ -349,7 +349,7 @@ impl TcpServer {
                                                             severity: "error".to_string(),
                                                             column: None,
                                                             file: Some("configuration".to_string()),
-                                                            category: Some("semantic".to_string()),
+                                                            category: "semantic".to_string(),
                                                             help_text: Some("Reduce configuration size or split into multiple files".to_string()),
                                                         }],
                                                         warnings: vec![],
