@@ -285,6 +285,15 @@ pub enum DiagnosticSeverity {
     Warning,
 }
 
+/// Error category for better error classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErrorCategory {
+    Syntax,      // Malformed S-expressions, parentheses issues
+    Semantic,    // Invalid key names, missing sections, logic errors
+    Include,     // File include errors
+    Platform,    // Platform-specific validation issues
+}
+
 /// A diagnostic message from configuration validation.
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
@@ -293,6 +302,8 @@ pub struct Diagnostic {
     pub column: Option<usize>,
     pub message: String,
     pub severity: DiagnosticSeverity,
+    pub category: ErrorCategory,
+    pub help_text: Option<String>,
 }
 
 /// Validate a configuration string and return structured diagnostics.
@@ -308,39 +319,83 @@ pub fn validate_config_with_files(
     let mut errors = Vec::new();
     let warnings = Vec::new(); // TODO: Implement warnings collection in future
     
-    // Try to parse the configuration using the existing parser
-    match new_from_str(cfg_text, file_content.clone()) {
-        Ok(_) => {
-            // Configuration is valid
+    // First, try basic S-expression parsing to catch syntax errors early
+    match sexpr::parse(cfg_text, "configuration") {
+        Ok(_exprs) => {
+            // S-expressions parsed successfully, now try full semantic validation
+            match new_from_str(cfg_text, file_content.clone()) {
+                Ok(_) => {
+                    // Configuration is fully valid
+                }
+                Err(err) => {
+                    // Semantic error - the syntax is valid but semantics failed
+                    let diagnostic = extract_diagnostic_from_miette_error(&err, ErrorCategory::Semantic);
+                    errors.push(diagnostic);
+                }
+            }
         }
-        Err(err) => {
-            let diagnostic = extract_diagnostic_from_miette_error(&err);
+        Err(parse_err) => {
+            // Syntax error in S-expressions - convert ParseError to miette::Error first
+            let miette_err: miette::Error = parse_err.into();
+            let diagnostic = extract_diagnostic_from_miette_error(&miette_err, ErrorCategory::Syntax);
             errors.push(diagnostic);
+            
+            // Don't try semantic validation if syntax is broken
         }
     }
     
     (errors, warnings)
 }
 
-fn extract_diagnostic_from_miette_error(err: &miette::Error) -> Diagnostic {
-    // Convert the error to string and try to extract useful information
-    let error_str = format!("{}", err);
+fn extract_diagnostic_from_miette_error(err: &miette::Error, category: ErrorCategory) -> Diagnostic {
+    // Get the full error message with context
+    let full_message = format!("{:?}", err);
+    let display_message = err.to_string();
     
-    // Try to extract line information from the error display
-    let line = extract_line_number_from_error_string(&error_str).unwrap_or(1);
+    // Enhanced parsing for line/column information
+    let line = extract_line_number_from_error_string(&full_message)
+        .or_else(|| extract_line_number_from_error_string(&display_message))
+        .unwrap_or(1);
+    let column = extract_column_number_from_error_string(&full_message)
+        .or_else(|| extract_column_number_from_error_string(&display_message));
+    
+    // Extract help text from the error chain if available
+    let help_text = if full_message.contains("For more info") {
+        extract_help_text(&full_message)
+    } else {
+        None
+    };
+    
+    // Clean up the main message
+    let clean_message = extract_clean_message(&display_message);
     
     Diagnostic {
         file: Some("configuration".to_string()),
         line,
-        column: None,
-        message: extract_clean_message(&error_str),
+        column,
+        message: clean_message,
         severity: DiagnosticSeverity::Error,
+        category,
+        help_text,
     }
 }
 
 fn extract_line_number_from_error_string(error_str: &str) -> Option<usize> {
-    // Look for patterns like "at line X" or "line X:"
+    // Look for patterns like "at line X" or "line X:" or "X:Y" (line:column)
     for line in error_str.lines() {
+        // Try "X:Y" pattern first (miette often uses this format)
+        if let Some(arrow_pos) = line.find("-->") {
+            if let Some(colon_pos) = line[arrow_pos..].find(':') {
+                let start = arrow_pos + colon_pos + 1;
+                if let Some(end) = line[start..].find(':') {
+                    if let Ok(line_num) = line[start..start + end].parse::<usize>() {
+                        return Some(line_num);
+                    }
+                }
+            }
+        }
+        
+        // Fallback patterns
         if let Some(pos) = line.find("at line ") {
             let start = pos + 8;
             if let Some(end) = line[start..].find(char::is_whitespace) {
@@ -361,12 +416,41 @@ fn extract_line_number_from_error_string(error_str: &str) -> Option<usize> {
     None
 }
 
+fn extract_column_number_from_error_string(error_str: &str) -> Option<usize> {
+    // Look for patterns like "X:Y" (line:column) after "-->"
+    for line in error_str.lines() {
+        if let Some(arrow_pos) = line.find("-->") {
+            // Look for line:column pattern
+            let after_arrow = &line[arrow_pos..];
+            if let Some(first_colon) = after_arrow.find(':') {
+                if let Some(second_colon) = after_arrow[first_colon + 1..].find(':') {
+                    let col_start = first_colon + 1 + second_colon + 1;
+                    let col_end = after_arrow[col_start..].find(char::is_whitespace).unwrap_or(after_arrow[col_start..].len());
+                    if let Ok(col_num) = after_arrow[col_start..col_start + col_end].parse::<usize>() {
+                        return Some(col_num);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn extract_clean_message(error_str: &str) -> String {
     // Remove the help text and keep only the main error message
     if let Some(help_start) = error_str.find("\n\nFor more info, see the configuration guide:") {
         error_str[..help_start].trim().to_string()
     } else {
         error_str.trim().to_string()
+    }
+}
+
+fn extract_help_text(error_str: &str) -> Option<String> {
+    // Extract help text if present
+    if let Some(help_start) = error_str.find("For more info, see the configuration guide:") {
+        Some(error_str[help_start..].trim().to_string())
+    } else {
+        None
     }
 }
 
@@ -378,6 +462,8 @@ fn extract_diagnostic_from_parse_error(parse_err: &ParseError) -> Diagnostic {
             column: Some(span.start.absolute - span.start.line_beginning + 1), // Convert to 1-based column
             message: parse_err.msg.clone(),
             severity: DiagnosticSeverity::Error,
+            category: ErrorCategory::Syntax, // ParseError is typically syntax
+            help_text: None,
         }
     } else {
         Diagnostic {
@@ -386,6 +472,8 @@ fn extract_diagnostic_from_parse_error(parse_err: &ParseError) -> Diagnostic {
             column: None,
             message: parse_err.msg.clone(),
             severity: DiagnosticSeverity::Error,
+            category: ErrorCategory::Syntax,
+            help_text: None,
         }
     }
 }

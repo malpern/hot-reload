@@ -30,6 +30,10 @@ pub struct ValidationError {
     pub column: Option<usize>,
     #[serde(default)]
     pub file: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>, // "syntax", "semantic", "include", "platform"
+    #[serde(default)]
+    pub help_text: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -177,6 +181,8 @@ mod tests {
                 severity: "error".to_string(),
                 column: Some(15),
                 file: Some("config.kbd".to_string()),
+                category: Some("syntax".to_string()),
+                help_text: Some("Check parentheses balance".to_string()),
             }],
             warnings: vec![ValidationError {
                 line: 10,
@@ -184,6 +190,8 @@ mod tests {
                 severity: "warning".to_string(),
                 column: None,
                 file: None,
+                category: Some("semantic".to_string()),
+                help_text: None,
             }],
             error_count: 1,
             warning_count: 1,
