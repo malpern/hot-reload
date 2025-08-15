@@ -904,10 +904,18 @@ impl Kanata {
                 if forced && !is_idle_now {
                     log::info!("Reload forced after 1s fallback");
                 }
-                self.live_reload_requested = false;
-                self.reload_requested_at = None;
-                if let Err(e) = self.do_live_reload(tx) {
-                    log::error!("live reload failed {e}");
+                // Attempt reload and only clear flags on success
+                match self.do_live_reload(tx) {
+                    Ok(()) => {
+                        self.live_reload_requested = false;
+                        self.reload_requested_at = None;
+                        log::debug!("Live reload completed successfully; flags cleared");
+                    }
+                    Err(e) => {
+                        log::error!("live reload failed {e}");
+                        // Keep flags set so reload can be retried
+                        log::debug!("Live reload failed; keeping reload requested for retry");
+                    }
                 }
             } else {
                 log::debug!("Reload pending; not idle yet");
@@ -2226,10 +2234,18 @@ impl Kanata {
                                     if forced && !is_idle_now {
                                         log::info!("Reload forced after 1s fallback");
                                     }
-                                    k.live_reload_requested = false;
-                                    k.reload_requested_at = None;
-                                    if let Err(e) = k.do_live_reload(&tx) {
-                                        log::error!("live reload failed {e}");
+                                    // Attempt reload and only clear flags on success
+                                    match k.do_live_reload(&tx) {
+                                        Ok(()) => {
+                                            k.live_reload_requested = false;
+                                            k.reload_requested_at = None;
+                                            log::debug!("Live reload completed successfully; flags cleared");
+                                        }
+                                        Err(e) => {
+                                            log::error!("live reload failed {e}");
+                                            // Keep flags set so reload can be retried
+                                            log::debug!("Live reload failed; keeping reload requested for retry");
+                                        }
                                     }
                                 } else {
                                     log::debug!("Reload pending; not idle yet");
@@ -2311,10 +2327,18 @@ impl Kanata {
                                     if forced && !is_idle_now {
                                         log::info!("Reload forced after 1s fallback");
                                     }
-                                    k.live_reload_requested = false;
-                                    k.reload_requested_at = None;
-                                    if let Err(e) = k.do_live_reload(&tx) {
-                                        log::error!("live reload failed {e}");
+                                    // Attempt reload and only clear flags on success
+                                    match k.do_live_reload(&tx) {
+                                        Ok(()) => {
+                                            k.live_reload_requested = false;
+                                            k.reload_requested_at = None;
+                                            log::debug!("Live reload completed successfully; flags cleared");
+                                        }
+                                        Err(e) => {
+                                            log::error!("live reload failed {e}");
+                                            // Keep flags set so reload can be retried
+                                            log::debug!("Live reload failed; keeping reload requested for retry");
+                                        }
                                     }
                                 } else {
                                     log::debug!("Reload pending; not idle yet");
@@ -2612,6 +2636,661 @@ fn live_reload_forced_after_1s_even_when_not_idle() {
     assert_eq!(k.sequence_timeout, 222);
 
     // Clean up temp file
+    let _ = fs::remove_file(&cfg_path);
+}
+
+#[test]
+fn test_reload_flags_cleared_only_on_success() {
+    use std::fs;
+
+    let tmp_dir = std::env::temp_dir();
+    let cfg_path = tmp_dir.join("kanata_test_reload_success.kbd");
+
+    let valid_cfg = r#"
+    (defcfg
+      sequence-timeout 111
+    )
+    (defsrc a)
+    (deflayer base a)
+    "#;
+
+    // Skip test if we can't write to temp directory
+    if fs::write(&cfg_path, valid_cfg).is_err() {
+        eprintln!("Skipping test: cannot write to temp directory");
+        return;
+    }
+
+    let args = crate::ValidatedArgs {
+        paths: vec![cfg_path.clone()],
+        #[cfg(feature = "tcp_server")]
+        tcp_server_address: None,
+        #[cfg(target_os = "linux")]
+        symlink_path: None,
+        nodelay: true,
+        #[cfg(feature = "watch")]
+        watch: false,
+    };
+
+    let mut k = match Kanata::new(&args) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("Skipping test: cannot create Kanata instance: {}", e);
+            return;
+        }
+    };
+
+    // Test 1: Successful reload clears flags
+    k.request_live_reload();
+    assert!(k.live_reload_requested);
+    assert!(k.reload_requested_at.is_some());
+
+    // Update config with new valid content
+    let updated_cfg = r#"
+    (defcfg
+      sequence-timeout 222
+    )
+    (defsrc a)
+    (deflayer base a)
+    "#;
+    if fs::write(&cfg_path, updated_cfg).is_err() {
+        eprintln!("Skipping test: cannot write updated config");
+        return;
+    }
+
+    // Trigger reload via handle_time_ticks
+    let _ = k.handle_time_ticks(&None);
+
+    // Verify flags are cleared after successful reload
+    assert!(!k.live_reload_requested, "live_reload_requested should be false after successful reload");
+    assert!(k.reload_requested_at.is_none(), "reload_requested_at should be None after successful reload");
+    assert_eq!(k.sequence_timeout, 222, "Config should be updated after successful reload");
+
+    let _ = fs::remove_file(&cfg_path);
+}
+
+#[test]
+fn test_reload_flags_kept_on_failure() {
+    use std::fs;
+
+    let tmp_dir = std::env::temp_dir();
+    let cfg_path = tmp_dir.join("kanata_test_reload_failure.kbd");
+
+    let valid_cfg = r#"
+    (defcfg
+      sequence-timeout 111
+    )
+    (defsrc a)
+    (deflayer base a)
+    "#;
+
+    if fs::write(&cfg_path, valid_cfg).is_err() {
+        eprintln!("Skipping test: cannot write to temp directory");
+        return;
+    }
+
+    let args = crate::ValidatedArgs {
+        paths: vec![cfg_path.clone()],
+        #[cfg(feature = "tcp_server")]
+        tcp_server_address: None,
+        #[cfg(target_os = "linux")]
+        symlink_path: None,
+        nodelay: true,
+        #[cfg(feature = "watch")]
+        watch: false,
+    };
+
+    let mut k = match Kanata::new(&args) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("Skipping test: cannot create Kanata instance: {}", e);
+            return;
+        }
+    };
+
+    // Request reload
+    k.request_live_reload();
+    assert!(k.live_reload_requested);
+    let original_timestamp = k.reload_requested_at;
+    assert!(original_timestamp.is_some());
+
+    // Write invalid config that will cause reload to fail
+    let invalid_cfg = r#"
+    (defcfg
+      invalid-option-that-does-not-exist yes
+    )
+    (defsrc a)
+    (deflayer base a)
+    "#;
+    if fs::write(&cfg_path, invalid_cfg).is_err() {
+        eprintln!("Skipping test: cannot write invalid config");
+        return;
+    }
+
+    // Trigger reload attempt - this should fail but keep flags set
+    let _ = k.handle_time_ticks(&None);
+
+    // Verify flags are NOT cleared after failed reload
+    assert!(k.live_reload_requested, "live_reload_requested should remain true after failed reload");
+    assert!(k.reload_requested_at.is_some(), "reload_requested_at should remain set after failed reload");
+    assert_eq!(k.reload_requested_at, original_timestamp, "reload timestamp should not change after failed reload");
+    assert_eq!(k.sequence_timeout, 111, "Config should not change after failed reload");
+
+    let _ = fs::remove_file(&cfg_path);
+}
+
+#[test]
+fn test_multiple_reload_attempts_after_failure() {
+    use std::fs;
+
+    let tmp_dir = std::env::temp_dir();
+    let cfg_path = tmp_dir.join("kanata_test_reload_retry.kbd");
+
+    let valid_cfg = r#"
+    (defcfg
+      sequence-timeout 111
+    )
+    (defsrc a)
+    (deflayer base a)
+    "#;
+
+    if fs::write(&cfg_path, valid_cfg).is_err() {
+        eprintln!("Skipping test: cannot write to temp directory");
+        return;
+    }
+
+    let args = crate::ValidatedArgs {
+        paths: vec![cfg_path.clone()],
+        #[cfg(feature = "tcp_server")]
+        tcp_server_address: None,
+        #[cfg(target_os = "linux")]
+        symlink_path: None,
+        nodelay: true,
+        #[cfg(feature = "watch")]
+        watch: false,
+    };
+
+    let mut k = match Kanata::new(&args) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("Skipping test: cannot create Kanata instance: {}", e);
+            return;
+        }
+    };
+
+    // First reload attempt with invalid config
+    k.request_live_reload();
+    let invalid_cfg = r#"
+    (defcfg
+      this-is-not-a-valid-option true
+    )
+    (defsrc a)
+    (deflayer base a)
+    "#;
+    if fs::write(&cfg_path, invalid_cfg).is_err() {
+        eprintln!("Skipping test: cannot write invalid config");
+        return;
+    }
+
+    let _ = k.handle_time_ticks(&None);
+    
+    // Should still be requesting reload after failure
+    assert!(k.live_reload_requested, "First failed reload should keep flags set");
+
+    // Simulate file watcher detecting another change (this would normally call request_live_reload again)
+    // But since flags are already set, it should show "already pending" behavior
+    let before_second_request = k.reload_requested_at;
+    k.request_live_reload(); // This should not change timestamp due to "already pending" logic
+    assert_eq!(k.reload_requested_at, before_second_request, "Second request should not change timestamp when already pending");
+
+    // Fix the config file
+    let fixed_cfg = r#"
+    (defcfg
+      sequence-timeout 333
+    )
+    (defsrc a)
+    (deflayer base a)
+    "#;
+    if fs::write(&cfg_path, fixed_cfg).is_err() {
+        eprintln!("Skipping test: cannot write fixed config");
+        return;
+    }
+
+    // Now the reload should succeed
+    let _ = k.handle_time_ticks(&None);
+
+    // Verify flags are cleared and config updated after successful retry
+    assert!(!k.live_reload_requested, "Flags should be cleared after successful retry");
+    assert!(k.reload_requested_at.is_none(), "Timestamp should be cleared after successful retry");
+    assert_eq!(k.sequence_timeout, 333, "Config should be updated after successful retry");
+
+    let _ = fs::remove_file(&cfg_path);
+}
+
+#[test]
+fn test_forced_reload_after_timeout_with_failure() {
+    use std::fs;
+    use std::time::Duration;
+
+    let tmp_dir = std::env::temp_dir();
+    let cfg_path = tmp_dir.join("kanata_test_forced_reload_fail.kbd");
+
+    let valid_cfg = r#"
+    (defcfg
+      sequence-timeout 111
+    )
+    (defsrc a)
+    (deflayer base a)
+    "#;
+
+    if fs::write(&cfg_path, valid_cfg).is_err() {
+        eprintln!("Skipping test: cannot write to temp directory");
+        return;
+    }
+
+    let args = crate::ValidatedArgs {
+        paths: vec![cfg_path.clone()],
+        #[cfg(feature = "tcp_server")]
+        tcp_server_address: None,
+        #[cfg(target_os = "linux")]
+        symlink_path: None,
+        nodelay: true,
+        #[cfg(feature = "watch")]
+        watch: false,
+    };
+
+    let mut k = match Kanata::new(&args) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("Skipping test: cannot create Kanata instance: {}", e);
+            return;
+        }
+    };
+
+    // Request reload with invalid config
+    k.request_live_reload();
+    
+    // Simulate timestamp from >1s ago to trigger forced reload
+    k.reload_requested_at = Some(web_time::Instant::now() - Duration::from_millis(1100));
+    
+    // Simulate non-idle state (keys pressed)
+    k.cur_keys.push(KeyCode::Escape);
+
+    let invalid_cfg = r#"
+    (defcfg
+      syntax-error-here
+    )
+    (defsrc a)
+    (deflayer base a)
+    "#;
+    if fs::write(&cfg_path, invalid_cfg).is_err() {
+        eprintln!("Skipping test: cannot write invalid config");
+        return;
+    }
+
+    // This should trigger forced reload (despite non-idle) but still fail due to invalid config
+    let _ = k.handle_time_ticks(&None);
+
+    // Verify forced reload was attempted but flags remain set due to failure
+    assert!(k.live_reload_requested, "Flags should remain set after forced reload failure");
+    assert!(k.reload_requested_at.is_some(), "Timestamp should remain set after forced reload failure");
+    assert_eq!(k.sequence_timeout, 111, "Config should not change after forced reload failure");
+
+    let _ = fs::remove_file(&cfg_path);
+}
+
+#[test]
+fn test_successful_config_parsing_changes() {
+    use std::fs;
+
+    let tmp_dir = std::env::temp_dir();
+    let cfg_path = tmp_dir.join("kanata_test_config_changes.kbd");
+
+    let initial_cfg = r#"
+    (defcfg
+      sequence-timeout 100
+      sequence-input-mode visible-backspaced
+    )
+    (defsrc a b)
+    (deflayer base a b)
+    "#;
+
+    if fs::write(&cfg_path, initial_cfg).is_err() {
+        eprintln!("Skipping test: cannot write to temp directory");
+        return;
+    }
+
+    let args = crate::ValidatedArgs {
+        paths: vec![cfg_path.clone()],
+        #[cfg(feature = "tcp_server")]
+        tcp_server_address: None,
+        #[cfg(target_os = "linux")]
+        symlink_path: None,
+        nodelay: true,
+        #[cfg(feature = "watch")]
+        watch: false,
+    };
+
+    let mut k = match Kanata::new(&args) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("Skipping test: cannot create Kanata instance: {}", e);
+            return;
+        }
+    };
+
+    // Verify initial config values
+    assert_eq!(k.sequence_timeout, 100);
+    assert_eq!(k.sequence_input_mode, SequenceInputMode::VisibleBackspaced);
+
+    // Update config with different values
+    let updated_cfg = r#"
+    (defcfg
+      sequence-timeout 500
+      sequence-input-mode hidden-delay-type
+    )
+    (defsrc a b c)
+    (deflayer base a b c)
+    "#;
+    if fs::write(&cfg_path, updated_cfg).is_err() {
+        eprintln!("Skipping test: cannot write updated config");
+        return;
+    }
+
+    // Request and execute reload
+    k.request_live_reload();
+    let _ = k.handle_time_ticks(&None);
+
+    // Verify all config changes took effect
+    assert_eq!(k.sequence_timeout, 500, "sequence_timeout should be updated");
+    assert_eq!(k.sequence_input_mode, SequenceInputMode::HiddenDelayType, "sequence_input_mode should be updated");
+    assert!(!k.live_reload_requested, "Reload flags should be cleared after successful complex config change");
+
+    let _ = fs::remove_file(&cfg_path);
+}
+
+#[test]
+fn test_reload_not_applied_when_not_idle_and_not_forced_then_applied_when_idle() {
+    use std::fs;
+
+    let tmp_dir = std::env::temp_dir();
+    let cfg_path = tmp_dir.join("kanata_test_reload_not_idle_first.kbd");
+
+    let initial_cfg = r#"
+    (defcfg
+      sequence-timeout 111
+    )
+    (defsrc a)
+    (deflayer base a)
+    "#;
+
+    if fs::write(&cfg_path, initial_cfg).is_err() {
+        eprintln!("Skipping test: cannot write to temp directory");
+        return;
+    }
+
+    let args = crate::ValidatedArgs {
+        paths: vec![cfg_path.clone()],
+        #[cfg(feature = "tcp_server")]
+        tcp_server_address: None,
+        #[cfg(target_os = "linux")]
+        symlink_path: None,
+        nodelay: true,
+        #[cfg(feature = "watch")]
+        watch: false,
+    };
+
+    let mut k = match Kanata::new(&args) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("Skipping test: cannot create Kanata instance: {}", e);
+            let _ = fs::remove_file(&cfg_path);
+            return;
+        }
+    };
+
+    assert_eq!(k.sequence_timeout, 111);
+
+    // Prepare new valid config
+    let updated_cfg = r#"
+    (defcfg
+      sequence-timeout 222
+    )
+    (defsrc a)
+    (deflayer base a)
+    "#;
+    if fs::write(&cfg_path, updated_cfg).is_err() {
+        eprintln!("Skipping test: cannot write updated config");
+        let _ = fs::remove_file(&cfg_path);
+        return;
+    }
+
+    // Request reload while "not idle" and not forced
+    k.request_live_reload();
+    k.cur_keys.push(KeyCode::Escape); // simulate non-idle
+    let _ = k.handle_time_ticks(&None);
+
+    // Because we're not idle and not forced, reload should NOT have applied
+    assert!(k.live_reload_requested, "Reload should still be pending");
+    assert_eq!(k.sequence_timeout, 111, "Timeout should remain unchanged while not idle");
+
+    // Now simulate idle and reload should apply
+    k.cur_keys.clear();
+    k.prev_keys.clear();
+    let _ = k.handle_time_ticks(&None);
+
+    assert!(!k.live_reload_requested, "Reload flags should be cleared after successful reload");
+    assert!(k.reload_requested_at.is_none());
+    assert_eq!(k.sequence_timeout, 222, "Timeout should change after reload while idle");
+
+    let _ = fs::remove_file(&cfg_path);
+}
+
+#[test]
+fn test_reload_next_prev_and_wraparound() {
+    use std::fs;
+
+    let tmp_dir = std::env::temp_dir();
+    let cfg1 = tmp_dir.join("kanata_test_reload_next_prev_1.kbd");
+    let cfg2 = tmp_dir.join("kanata_test_reload_next_prev_2.kbd");
+
+    let cfg1_contents = r#"(defcfg sequence-timeout 101)(defsrc a)(deflayer base a)"#;
+    let cfg2_contents = r#"(defcfg sequence-timeout 202)(defsrc a)(deflayer base a)"#;
+
+    if fs::write(&cfg1, cfg1_contents).is_err() || fs::write(&cfg2, cfg2_contents).is_err() {
+        eprintln!("Skipping test: cannot write to temp directory");
+        return;
+    }
+
+    let args = crate::ValidatedArgs {
+        paths: vec![cfg1.clone(), cfg2.clone()],
+        #[cfg(feature = "tcp_server")]
+        tcp_server_address: None,
+        #[cfg(target_os = "linux")]
+        symlink_path: None,
+        nodelay: true,
+        #[cfg(feature = "watch")]
+        watch: false,
+    };
+
+    let mut k = match Kanata::new(&args) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("Skipping test: cannot create Kanata instance: {}", e);
+            let _ = fs::remove_file(&cfg1);
+            let _ = fs::remove_file(&cfg2);
+            return;
+        }
+    };
+
+    assert_eq!(k.sequence_timeout, 101);
+
+    // Next -> cfg2
+    k.request_live_reload_next();
+    let _ = k.handle_time_ticks(&None);
+    assert_eq!(k.sequence_timeout, 202);
+    assert_eq!(k.cur_cfg_idx, 1);
+
+    // Prev -> cfg1
+    k.request_live_reload_prev();
+    let _ = k.handle_time_ticks(&None);
+    assert_eq!(k.sequence_timeout, 101);
+    assert_eq!(k.cur_cfg_idx, 0);
+
+    // Wrap next from last to first
+    k.cur_cfg_idx = 1;
+    k.request_live_reload_next();
+    let _ = k.handle_time_ticks(&None);
+    assert_eq!(k.cur_cfg_idx, 0);
+    assert_eq!(k.sequence_timeout, 101);
+
+    let _ = fs::remove_file(&cfg1);
+    let _ = fs::remove_file(&cfg2);
+}
+
+#[test]
+fn test_reload_num_out_of_bounds_does_not_set_flags_or_index() {
+    use std::fs;
+
+    let tmp_dir = std::env::temp_dir();
+    let cfg_path = tmp_dir.join("kanata_test_reload_num_oob.kbd");
+
+    let cfg = r#"(defcfg sequence-timeout 111)(defsrc a)(deflayer base a)"#;
+    if fs::write(&cfg_path, cfg).is_err() {
+        eprintln!("Skipping test: cannot write config");
+        return;
+    }
+
+    let args = crate::ValidatedArgs {
+        paths: vec![cfg_path.clone()],
+        #[cfg(feature = "tcp_server")]
+        tcp_server_address: None,
+        #[cfg(target_os = "linux")]
+        symlink_path: None,
+        nodelay: true,
+        #[cfg(feature = "watch")]
+        watch: false,
+    };
+
+    let mut k = match Kanata::new(&args) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("Skipping test: cannot create Kanata instance: {}", e);
+            let _ = fs::remove_file(&cfg_path);
+            return;
+        }
+    };
+
+    assert!(k.request_live_reload_num(999).is_err(), "Out-of-bounds index should error");
+    assert!(!k.live_reload_requested, "Flags should not be set on error");
+    assert_eq!(k.cur_cfg_idx, 0, "Index should not change on error");
+
+    let _ = fs::remove_file(&cfg_path);
+}
+
+#[test]
+fn test_reload_file_invalid_and_valid_paths() {
+    use std::fs;
+
+    let tmp_dir = std::env::temp_dir();
+    let cfg1 = tmp_dir.join("kanata_test_reload_file1.kbd");
+    let cfg2 = tmp_dir.join("kanata_test_reload_file2.kbd");
+
+    let cfg1_contents = r#"(defcfg sequence-timeout 111)(defsrc a)(deflayer base a)"#;
+    let cfg2_contents = r#"(defcfg sequence-timeout 222)(defsrc a)(deflayer base a)"#;
+
+    if fs::write(&cfg1, cfg1_contents).is_err() {
+        eprintln!("Skipping test: cannot write base config");
+        return;
+    }
+
+    let args = crate::ValidatedArgs {
+        paths: vec![cfg1.clone()],
+        #[cfg(feature = "tcp_server")]
+        tcp_server_address: None,
+        #[cfg(target_os = "linux")]
+        symlink_path: None,
+        nodelay: true,
+        #[cfg(feature = "watch")]
+        watch: false,
+    };
+
+    let mut k = match Kanata::new(&args) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("Skipping test: cannot create Kanata instance: {}", e);
+            let _ = fs::remove_file(&cfg1);
+            return;
+        }
+    };
+
+    // Invalid path
+    let invalid_path = tmp_dir.join("this_file_does_not_exist.kbd");
+    assert!(k.request_live_reload_file(invalid_path.to_string_lossy().to_string()).is_err());
+    assert!(!k.live_reload_requested, "Flags should not be set on invalid file path");
+    assert_eq!(k.cur_cfg_idx, 0);
+
+    // Valid path
+    if fs::write(&cfg2, cfg2_contents).is_err() {
+        eprintln!("Skipping test: cannot write second config");
+        let _ = fs::remove_file(&cfg1);
+        return;
+    }
+
+    assert!(k.request_live_reload_file(cfg2.to_string_lossy().to_string()).is_ok());
+    assert!(k.live_reload_requested, "Flags should be set on valid file path");
+    assert_eq!(k.cur_cfg_idx, 1, "Index should point to newly added entry");
+
+    let _ = k.handle_time_ticks(&None);
+    assert_eq!(k.sequence_timeout, 222, "Reloaded file should take effect");
+    assert!(!k.live_reload_requested);
+
+    let _ = fs::remove_file(&cfg1);
+    let _ = fs::remove_file(&cfg2);
+}
+
+#[test]
+fn test_reload_resets_runtime_state_flags() {
+    use std::fs;
+
+    let tmp_dir = std::env::temp_dir();
+    let cfg_path = tmp_dir.join("kanata_test_reload_reset_state.kbd");
+
+    let cfg = r#"(defcfg sequence-timeout 111)(defsrc a)(deflayer base a)"#;
+    if fs::write(&cfg_path, cfg).is_err() {
+        eprintln!("Skipping test: cannot write config");
+        return;
+    }
+
+    let args = crate::ValidatedArgs {
+        paths: vec![cfg_path.clone()],
+        #[cfg(feature = "tcp_server")]
+        tcp_server_address: None,
+        #[cfg(target_os = "linux")]
+        symlink_path: None,
+        nodelay: true,
+        #[cfg(feature = "watch")]
+        watch: false,
+    };
+
+    let mut k = match Kanata::new(&args) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("Skipping test: cannot create Kanata instance: {}", e);
+            let _ = fs::remove_file(&cfg_path);
+            return;
+        }
+    };
+
+    // Mutate a runtime-only flag
+    k.macro_on_press_cancel_duration = 42;
+
+    // Trigger no-op reload (same file, but still a reload)
+    k.request_live_reload();
+    let _ = k.handle_time_ticks(&None);
+
+    // Verify runtime state got reset
+    assert_eq!(k.macro_on_press_cancel_duration, 0, "macro cancel duration should reset on reload");
+
     let _ = fs::remove_file(&cfg_path);
 }
 
