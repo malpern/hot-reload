@@ -44,6 +44,13 @@ fn validate_config_content(config_content: &str, request_id: Option<String>) -> 
         },
         column: d.column,
         file: d.file,
+        category: match d.category {
+            cfg::ErrorCategory::Syntax => "syntax".to_string(),
+            cfg::ErrorCategory::Semantic => "semantic".to_string(),
+            cfg::ErrorCategory::Include => "include".to_string(),
+            cfg::ErrorCategory::Platform => "platform".to_string(),
+        },
+        help_text: d.help_text,
     };
     
     let converted_errors: Vec<ValidationError> = errors.into_iter().map(convert_diagnostic).collect();
@@ -342,6 +349,8 @@ impl TcpServer {
                                                             severity: "error".to_string(),
                                                             column: None,
                                                             file: Some("configuration".to_string()),
+                                                            category: "semantic".to_string(),
+                                                            help_text: Some("Reduce configuration size or split into multiple files".to_string()),
                                                         }],
                                                         warnings: vec![],
                                                         error_count: 1,

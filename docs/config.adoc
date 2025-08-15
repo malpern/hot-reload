@@ -4562,6 +4562,71 @@ The TCP server supports live configuration reloading through the following comma
 
 These commands mirror the existing keyboard live reload actions and allow external tools to trigger configuration reloads via TCP.
 
+==== TCP Configuration Validation
+
+The TCP server supports real-time configuration validation via the `ValidateConfig` command:
+
+[source,json]
+----
+{
+  "ValidateConfig": {
+    "config_content": "(defsrc esc 1) (deflayer default esc 1)",
+    "request_id": "optional-correlation-id"
+  }
+}
+----
+
+The server responds with a structured `ValidationResult`:
+
+[source,json]
+----
+{
+  "ValidationResult": {
+    "success": true,
+    "errors": [],
+    "warnings": [], 
+    "error_count": 0,
+    "warning_count": 0,
+    "request_id": "optional-correlation-id"
+  }
+}
+----
+
+For invalid configurations, the response includes detailed error information:
+
+[source,json]
+----
+{
+  "ValidationResult": {
+    "success": false,
+    "errors": [
+      {
+        "line": 3,
+        "column": 15,
+        "message": "Unclosed opening parenthesis",
+        "severity": "error",
+        "category": "syntax",
+        "file": "configuration",
+        "help_text": "Check parentheses balance"
+      }
+    ],
+    "warnings": [],
+    "error_count": 1,
+    "warning_count": 0,
+    "request_id": "optional-correlation-id"
+  }
+}
+----
+
+For validation-only clients, send `SetSessionMode` with `quiet: true` as the first message to suppress initial layer change events:
+
+[source,json]
+----
+{"SetSessionMode": {"quiet": true}}
+----
+
+This feature enables IDE integrations and configuration tools to validate Kanata configurations without spawning separate processes.
+
 [[args-quiet]]
 === Disable logs other than errors: `-q`, `--quiet`
 
