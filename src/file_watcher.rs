@@ -5,9 +5,7 @@
 
 use crate::kanata::Kanata;
 use anyhow::Result;
-use notify_debouncer_mini::{
-    DebounceEventResult, DebouncedEventKind, new_debouncer, notify::RecursiveMode,
-};
+use notify_debouncer_mini::{DebounceEventResult, new_debouncer, notify::RecursiveMode};
 use parking_lot::Mutex;
 use std::fs;
 use std::path::PathBuf;
@@ -64,8 +62,23 @@ pub fn start_file_watcher(kanata_arc: Arc<Mutex<Kanata>>) -> Result<()> {
         k.cfg_paths.clone()
     };
 
+    log::info!(
+        "Starting file watcher for {} config file(s)",
+        cfg_paths.len()
+    );
+    for (i, path) in cfg_paths.iter().enumerate() {
+        log::info!("  Config file {}: {}", i + 1, path.display());
+    }
+
     // Discover include files and update kanata
     let included_files = discover_include_files(&cfg_paths);
+    if !included_files.is_empty() {
+        log::info!("Found {} include file(s) to watch", included_files.len());
+        for (i, path) in included_files.iter().enumerate() {
+            log::info!("  Include file {}: {}", i + 1, path.display());
+        }
+    }
+
     {
         let mut k = kanata_arc.lock();
         k.included_files = included_files.clone();
@@ -77,10 +90,10 @@ pub fn start_file_watcher(kanata_arc: Arc<Mutex<Kanata>>) -> Result<()> {
     // Store the debouncer in the Kanata struct
     {
         let mut k = kanata_arc.lock();
-        log::info!("file watcher started for Kanata {:p}", &*k);
         k.file_watcher = Some(debouncer);
     }
 
+    log::info!("File watcher initialized successfully");
     Ok(())
 }
 
@@ -98,71 +111,157 @@ pub fn create_debouncer(
         .cloned()
         .collect();
 
-    // Create debouncer with 500ms timeout and event handling closure
+    // Create debouncer with platform-appropriate timeout and event handling closure
+    // Use longer timeout on macOS to handle atomic save bursts from editors
+    let debounce_timeout = if cfg!(target_os = "macos") {
+        Duration::from_millis(750)
+    } else {
+        Duration::from_millis(500)
+    };
     let kanata_arc_clone = kanata_arc.clone();
-    let mut debouncer = new_debouncer(
-        Duration::from_millis(500),
-        move |result: DebounceEventResult| {
-            match result {
-                Ok(events) => {
-                    for event in events {
-                        // Check if the changed file is one of our watched files
-                        if all_watched_files.iter().any(|watched_path| {
-                            event.path.canonicalize().unwrap_or(event.path.clone())
-                                == watched_path.canonicalize().unwrap_or(watched_path.clone())
-                        }) {
-                            match event.kind {
-                                DebouncedEventKind::Any => {
-                                    log::info!(
-                                        "Config file changed: {}, triggering reload",
-                                        event.path.display()
-                                    );
+    let mut debouncer = new_debouncer(debounce_timeout, move |result: DebounceEventResult| {
+        match result {
+            Ok(events) => {
+                for event in events {
+                    log::debug!(
+                        "File watcher event received: {:?} for path: {}",
+                        event.kind,
+                        event.path.display()
+                    );
 
-                                    // Set the live_reload_requested flag
-                                    if let Some(mut kanata) = kanata_arc_clone.try_lock() {
-                                        log::debug!(
-                                            "watcher: setting live_reload_requested on Kanata {:p}",
-                                            &*kanata
-                                        );
-                                        kanata.request_live_reload();
-                                    } else {
-                                        log::warn!(
-                                            "watcher: Could not acquire lock to set live_reload_requested"
-                                        );
-                                    }
-                                }
-                                _ => {
-                                    log::trace!(
-                                        "Ignoring file event: {:?} for {}",
-                                        event.kind,
-                                        event.path.display()
+                    // Check if the changed file is one of our watched files
+                    // Use multiple path comparison strategies to handle different cases
+                    let is_watched_file = all_watched_files.iter().any(|watched_path| {
+                        // Try exact path match first
+                        if event.path == *watched_path {
+                            return true;
+                        }
+
+                        // Try canonicalized paths (handles symlinks and relative paths)
+                        if let (Ok(event_canonical), Ok(watched_canonical)) =
+                            (event.path.canonicalize(), watched_path.canonicalize())
+                        {
+                            if event_canonical == watched_canonical {
+                                return true;
+                            }
+                        }
+
+                        // Try path comparison after converting to absolute paths as fallback
+                        let event_absolute = event
+                            .path
+                            .canonicalize()
+                            .or_else(|_| std::env::current_dir().map(|pwd| pwd.join(&event.path)));
+                        let watched_absolute = watched_path
+                            .canonicalize()
+                            .or_else(|_| std::env::current_dir().map(|pwd| pwd.join(watched_path)));
+
+                        if let (Ok(event_abs), Ok(watched_abs)) = (event_absolute, watched_absolute)
+                        {
+                            return event_abs == watched_abs;
+                        }
+
+                        false
+                    });
+
+                    if is_watched_file {
+                        log::info!(
+                            "Config file changed: {} (event: {:?}), triggering reload",
+                            event.path.display(),
+                            event.kind
+                        );
+
+                        // Set the live_reload_requested flag
+                        if let Some(mut kanata) = kanata_arc_clone.try_lock() {
+                            kanata.request_live_reload();
+                        } else {
+                            log::warn!("Could not acquire lock to set live_reload_requested");
+                        }
+                    } else {
+                        // Fallback: handle macOS directory-level events and atomic replace edge cases.
+                        // If the event is in the same parent directory and the basename matches one of the watched files,
+                        // also trigger reload. This helps when the rename event uses a temp file path.
+                        let mut parent_dir_match = false;
+                        if let Some(event_parent) = event.path.parent() {
+                            parent_dir_match = all_watched_files.iter().any(|wf| {
+                                wf.parent() == Some(event_parent)
+                                    && wf.file_name().is_some()
+                                    && event.path.file_name().is_some()
+                                    && wf.file_name() == event.path.file_name()
+                            });
+                        }
+
+                        if parent_dir_match {
+                            log::info!(
+                                "Directory-level change for watched file: {} (event: {:?}), triggering reload",
+                                event.path.display(),
+                                event.kind
+                            );
+                            if let Some(mut kanata) = kanata_arc_clone.try_lock() {
+                                kanata.request_live_reload();
+                            } else {
+                                log::warn!("Could not acquire lock to set live_reload_requested");
+                            }
+                        } else {
+                            // Handle directory-only events (common on macOS due to FSEvents coalescing)
+                            // If the event is for a directory that is the parent of any watched file, trigger reload
+                            let dir_is_parent_of_watched = event.path.is_dir()
+                                && all_watched_files.iter().any(|wf| {
+                                    wf.parent().map(|p| p == event.path).unwrap_or(false)
+                                });
+
+                            if dir_is_parent_of_watched {
+                                log::info!(
+                                    "Directory-level change for parent of watched files: {} (event: {:?}), triggering reload",
+                                    event.path.display(),
+                                    event.kind
+                                );
+                                if let Some(mut kanata) = kanata_arc_clone.try_lock() {
+                                    kanata.request_live_reload();
+                                } else {
+                                    log::warn!(
+                                        "Could not acquire lock to set live_reload_requested"
                                     );
                                 }
+                            } else {
+                                log::trace!(
+                                    "Ignoring event for non-watched file or directory: {}",
+                                    event.path.display()
+                                );
                             }
                         }
                     }
                 }
-                Err(e) => {
-                    log::error!("File watcher error: {:?}", e);
-                }
             }
-        },
-    )?;
+            Err(e) => {
+                log::error!("File watcher error: {:?}", e);
+            }
+        }
+    })?;
 
     // Watch all config files
     for path in cfg_paths {
-        debouncer
-            .watcher()
-            .watch(path, RecursiveMode::NonRecursive)?;
-        log::info!("Watching config file for changes: {}", path.display());
+        match debouncer.watcher().watch(path, RecursiveMode::NonRecursive) {
+            Ok(()) => {
+                log::info!("Successfully watching config file: {}", path.display());
+            }
+            Err(e) => {
+                log::error!("Failed to watch config file {}: {}", path.display(), e);
+                return Err(e.into());
+            }
+        }
     }
 
     // Watch included files
     for path in included_files {
-        debouncer
-            .watcher()
-            .watch(path, RecursiveMode::NonRecursive)?;
-        log::info!("Watching included file for changes: {}", path.display());
+        match debouncer.watcher().watch(path, RecursiveMode::NonRecursive) {
+            Ok(()) => {
+                log::info!("Successfully watching included file: {}", path.display());
+            }
+            Err(e) => {
+                log::error!("Failed to watch included file {}: {}", path.display(), e);
+                return Err(e.into());
+            }
+        }
     }
 
     Ok(debouncer)
