@@ -891,10 +891,18 @@ impl Kanata {
                 if forced && !is_idle_now {
                     log::info!("Reload forced after 1s fallback");
                 }
-                self.live_reload_requested = false;
-                self.reload_requested_at = None;
-                if let Err(e) = self.do_live_reload(tx) {
-                    log::error!("live reload failed {e}");
+                // Attempt reload and only clear flags on success
+                match self.do_live_reload(tx) {
+                    Ok(()) => {
+                        self.live_reload_requested = false;
+                        self.reload_requested_at = None;
+                        log::debug!("Live reload completed successfully; flags cleared");
+                    }
+                    Err(e) => {
+                        log::error!("live reload failed {e}");
+                        // Keep flags set so reload can be retried
+                        log::debug!("Live reload failed; keeping reload requested for retry");
+                    }
                 }
             } else {
                 log::debug!("Reload pending; not idle yet");
@@ -2191,10 +2199,18 @@ impl Kanata {
                                     if forced && !is_idle_now {
                                         log::info!("Reload forced after 1s fallback");
                                     }
-                                    k.live_reload_requested = false;
-                                    k.reload_requested_at = None;
-                                    if let Err(e) = k.do_live_reload(&tx) {
-                                        log::error!("live reload failed {e}");
+                                    // Attempt reload and only clear flags on success
+                                    match k.do_live_reload(&tx) {
+                                        Ok(()) => {
+                                            k.live_reload_requested = false;
+                                            k.reload_requested_at = None;
+                                            log::debug!("Live reload completed successfully; flags cleared");
+                                        }
+                                        Err(e) => {
+                                            log::error!("live reload failed {e}");
+                                            // Keep flags set so reload can be retried
+                                            log::debug!("Live reload failed; keeping reload requested for retry");
+                                        }
                                     }
                                 } else {
                                     log::debug!("Reload pending; not idle yet");
@@ -2267,10 +2283,18 @@ impl Kanata {
                                     if forced && !is_idle_now {
                                         log::info!("Reload forced after 1s fallback");
                                     }
-                                    k.live_reload_requested = false;
-                                    k.reload_requested_at = None;
-                                    if let Err(e) = k.do_live_reload(&tx) {
-                                        log::error!("live reload failed {e}");
+                                    // Attempt reload and only clear flags on success
+                                    match k.do_live_reload(&tx) {
+                                        Ok(()) => {
+                                            k.live_reload_requested = false;
+                                            k.reload_requested_at = None;
+                                            log::debug!("Live reload completed successfully; flags cleared");
+                                        }
+                                        Err(e) => {
+                                            log::error!("live reload failed {e}");
+                                            // Keep flags set so reload can be retried
+                                            log::debug!("Live reload failed; keeping reload requested for retry");
+                                        }
                                     }
                                 } else {
                                     log::debug!("Reload pending; not idle yet");
